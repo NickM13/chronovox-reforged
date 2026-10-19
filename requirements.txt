@@ -1,0 +1,7 @@
+numpy
+moderngl
+glfw
+pyglm
+PyOpenGL
+imgui-bundle
+pytest
