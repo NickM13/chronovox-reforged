@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .editing import flood_region_3d
+from .editing import flood_region_3d, similar_mask
 
 Cell = tuple[int, int, int]
 
@@ -66,13 +66,20 @@ def box_mask(voxels: np.ndarray, a: Cell, b: Cell) -> np.ndarray:
     return mask
 
 
-def wand_mask(voxels: np.ndarray, seed: Cell) -> np.ndarray:
-    """Every voxel of the seed voxel's color that is connected to it through shared faces. Empty if the seed is empty."""
+def wand_mask(voxels: np.ndarray, seed: Cell, palette: np.ndarray | None = None, contiguous: bool = True,
+              tolerance: float = 0.0) -> np.ndarray:
+    """Every voxel of the seed voxel's color that is connected to it through shared faces. Empty if the seed is empty.
+
+    With a ``palette`` and a ``tolerance`` colors close to the seed's count as well, and without ``contiguous``
+    the voxels need not be connected to the seed.
+    """
     x, y, z = seed
     depth, height, width = voxels.shape
     if not (0 <= x < width and 0 <= y < height and 0 <= z < depth) or voxels[z, y, x] == 0:
         return np.zeros(voxels.shape, bool)
-    return flood_region_3d(voxels == voxels[z, y, x], seed)
+    matches = similar_mask(voxels, palette, int(voxels[z, y, x]), tolerance) if palette is not None \
+        else voxels == voxels[z, y, x]
+    return flood_region_3d(matches, seed) if contiguous else matches
 
 
 def all_mask(voxels: np.ndarray) -> np.ndarray:

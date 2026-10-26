@@ -19,7 +19,7 @@ Cell = tuple[int, int, int]
 class Tool(Enum):
     PLACE = "Place"
     ERASE = "Erase"
-    PAINT = "Paint"
+    PAINT = "Replace"
     PICK = "Pick color"
     SELECT = "Select"
     FILL_APPEND = "Fill: append"
@@ -62,7 +62,7 @@ class VoxelTool(Enum):
     """What the toolbar offers in Voxel mode: one button each, whatever action and brush it is made of inside."""
     PLACE = "Place"
     ERASE = "Erase"
-    PAINT = "Paint"
+    PAINT = "Replace"
     PICK = "Pick color"
     SELECT_BOX = "Box select"
     SELECT_WAND = "Wand select"
@@ -238,6 +238,25 @@ def expansion_for(cell: Cell, size: Cell) -> tuple[Cell, Cell] | None:
     return (low, high) if any(low) or any(high) else None
 
 
+def symmetric_expansion(cell: Cell, size: Cell, mirror: tuple[bool, bool, bool],
+                        radial: "Radial | None") -> tuple[Cell, Cell] | None:
+    """How a matrix has to grow to take a cell and all its mirrored and turned copies, as (low, high) like expansion_for.
+
+    On the axes the symmetry works across (mirrored ones, and the two a radial turn moves things on) the growth is the
+    same on both sides, so the center the copies are made around does not move. None if every copy is inside already.
+    """
+    cells = symmetric_cells(cell, size, mirror, radial)
+    low = [max(0, -min(c[i] for c in cells)) for i in range(3)]
+    high = [max(0, max(c[i] for c in cells) - size[i] + 1) for i in range(3)]
+    across = [bool(m) for m in mirror]
+    if radial is not None and radial[1] > 1:
+        across = [a or i != radial[0] for i, a in enumerate(across)]
+    for i in range(3):
+        if across[i]:
+            low[i] = high[i] = max(low[i], high[i])
+    return (tuple(low), tuple(high)) if any(low) or any(high) else None
+
+
 def cell_after_expansion(cell: Cell, low: Cell) -> Cell:
     """Where a cell is numbered once the matrix has grown by ``low`` cells on its low sides (the cells all move up)."""
     return tuple(c + l for c, l in zip(cell, low))
@@ -265,6 +284,160 @@ def place_face(voxels: np.ndarray, origin, direction, outside: bool = False) -> 
         return None
     axis = next(a for a in range(3) if hit.normal[a])
     return cell, axis, -hit.normal[axis]
+
+
+def mirror_cells(cell: Cell, size: Cell, axes: tuple[bool, bool, bool]) -> list[Cell]:
+    """The cell and its reflections across the center planes of the enabled axes (x, y, z). The cell itself comes first.
+
+    With several axes on, every combination is included (2, 4 or 8 cells); cells on a plane are not repeated.
+    """
+    cells = [tuple(cell)]
+    for axis, on in enumerate(axes):
+        if on:
+            for c in list(cells):
+                flipped = c[:axis] + (size[axis] - 1 - c[axis],) + c[axis + 1:]
+                if flipped not in cells:
+                    cells.append(flipped)
+    return cells
+
+
+def mirror_boxes(a: Cell, b: Cell, size: Cell, axes: tuple[bool, bool, bool]) -> list[tuple[Cell, Cell]]:
+    """The box between two corners and its reflections, as corner pairs (the box itself first)."""
+    boxes = [(tuple(a), tuple(b))]
+    for axis, on in enumerate(axes):
+        if on:
+            for lo, hi in list(boxes):
+                flip = lambda c: c[:axis] + (size[axis] - 1 - c[axis],) + c[axis + 1:]
+                other = (flip(lo), flip(hi))
+                if other not in boxes and (other[1], other[0]) not in boxes:
+                    boxes.append(other)
+    return boxes
+
+
+def mirror_targets(target: "FillTarget", size: Cell, axes: tuple[bool, bool, bool]) -> list["FillTarget"]:
+    """A fill target and its reflections. Reflecting across the face's own axis turns the append direction around."""
+    targets = [target]
+    for axis, on in enumerate(axes):
+        if on:
+            for t in list(targets):
+                cell = t.cell[:axis] + (size[axis] - 1 - t.cell[axis],) + t.cell[axis + 1:]
+                sign = -t.sign if t.axis == axis else t.sign
+                flipped = FillTarget(cell, t.axis, sign)
+                if flipped not in targets:
+                    targets.append(flipped)
+    return targets
+
+
+Radial = tuple[int, int]   # (axis the copies turn around, how many copies make a full turn)
+
+_PLANE = ((1, 2), (2, 0), (0, 1))   # the two axes that turn around axis 0, 1, 2
+
+
+def _turn(angle: float) -> tuple[float, float]:
+    """cos and sin of an angle, exact at the quarter turns so they round-trip cleanly."""
+    c, s = math.cos(angle), math.sin(angle)
+    return (0.0 if abs(c) < 1e-9 else c), (0.0 if abs(s) < 1e-9 else s)
+
+
+def rotate_cells(cells: np.ndarray, size: Cell, radial: Radial, step: int) -> np.ndarray:
+    """Turn (N, 3) cells around the center of the matrix by ``step`` copies' worth, to the nearest cells.
+
+    Cells that land outside the grid are left out of range for the caller to drop.
+    """
+    axis, count = radial
+    u, v = _PLANE[axis]
+    cos, sin = _turn(2.0 * math.pi * step / count)
+    du = cells[:, u] + 0.5 - size[u] / 2
+    dv = cells[:, v] + 0.5 - size[v] / 2
+    out = np.array(cells, dtype=np.int64)
+    out[:, u] = np.floor(du * cos - dv * sin + size[u] / 2 + 1e-9).astype(np.int64)
+    out[:, v] = np.floor(du * sin + dv * cos + size[v] / 2 + 1e-9).astype(np.int64)
+    return out
+
+
+def symmetric_cells(cell: Cell, size: Cell, mirror: tuple[bool, bool, bool], radial: Radial | None) -> list[Cell]:
+    """The cell and every copy of it under the radial turns and the mirrors. The cell itself comes first."""
+    turned = [tuple(cell)]
+    if radial is not None and radial[1] > 1:
+        for step in range(1, radial[1]):
+            turned.append(tuple(int(c) for c in rotate_cells(np.array([cell]), size, radial, step)[0]))
+    cells: list[Cell] = []
+    for c in turned:
+        for m in mirror_cells(c, size, mirror):
+            if m not in cells:
+                cells.append(m)
+    return cells
+
+
+def symmetric_targets(target: "FillTarget", size: Cell, mirror: tuple[bool, bool, bool],
+                      radial: Radial | None) -> list["FillTarget"]:
+    """A fill target and its copies. A turn that is not a quarter turn only keeps a face on the turning axis flat."""
+    turned = [target]
+    if radial is not None and radial[1] > 1:
+        axis, count = radial
+        u, v = _PLANE[axis]
+        for step in range(1, count):
+            cell = tuple(int(c) for c in rotate_cells(np.array([target.cell]), size, radial, step)[0])
+            if target.axis == axis:
+                turned.append(FillTarget(cell, target.axis, target.sign))
+            elif (4 * step) % count == 0:                       # a quarter turn: the face moves to the other axis
+                cos, sin = _turn(2.0 * math.pi * step / count)
+                normal = [0, 0, 0]
+                normal[target.axis] = target.sign
+                nu, nv = normal[u], normal[v]
+                ru, rv = round(nu * cos - nv * sin), round(nu * sin + nv * cos)
+                new_axis = u if ru else v
+                turned.append(FillTarget(cell, new_axis, ru or rv))
+    targets: list[FillTarget] = []
+    for t in turned:
+        for m in mirror_targets(t, size, mirror):
+            if m not in targets:
+                targets.append(m)
+    return targets
+
+
+def symmetric_box_cells(a: Cell, b: Cell, size: Cell, mirror: tuple[bool, bool, bool], radial: Radial) -> np.ndarray:
+    """Every in-range cell covered by the box between two corners and its radial turns and mirrors, as (N, 3)."""
+    lo = [max(min(a[i], b[i]), 0) for i in range(3)]
+    hi = [min(max(a[i], b[i]), size[i] - 1) for i in range(3)]
+    if any(l > h for l, h in zip(lo, hi)):
+        return np.zeros((0, 3), np.int64)
+    grid = np.mgrid[lo[0]:hi[0] + 1, lo[1]:hi[1] + 1, lo[2]:hi[2] + 1].reshape(3, -1).T
+    parts = [grid if step == 0 else rotate_cells(grid, size, radial, step) for step in range(radial[1])]
+    for axis, on in enumerate(mirror):
+        if on:
+            flipped = []
+            for part in parts:
+                f = part.copy()
+                f[:, axis] = size[axis] - 1 - f[:, axis]
+                flipped.append(f)
+            parts += flipped
+    cells = np.concatenate(parts)
+    inside = np.all((cells >= 0) & (cells < np.array(size)), axis=1)
+    return np.unique(cells[inside], axis=0)
+
+
+def apply_cells(model: Model, matrix: Matrix, tool: Tool, cells: np.ndarray,
+                color: tuple[int, int, int, int], only_color: int | None = None) -> bool:
+    """Like apply_box, for an arbitrary set of (N, 3) cells. Returns True if the voxel grid changed."""
+    if len(cells) == 0:
+        return False
+    z, y, x = cells[:, 2], cells[:, 1], cells[:, 0]
+    current = matrix.voxels[z, y, x]
+    if tool is Tool.ERASE:
+        new = np.zeros_like(current)
+    elif tool is Tool.PLACE:
+        new = np.full_like(current, model.index_for_color(color))
+    elif tool is Tool.PAINT:
+        chosen = (current != 0) if only_color is None else (current == only_color)
+        if not chosen.any() or (only_color is not None and model.find_color(color) == only_color):
+            return False
+        new = np.where(chosen, model.index_for_color(color), current).astype(current.dtype)
+    else:
+        return False
+    changed = bool((new != current).any())
+    matrix.voxels[z, y, x] = new
+    return changed
 
 
 def apply_tool(model: Model, matrix: Matrix, tool: Tool, cell: Cell,
@@ -486,14 +659,32 @@ def _in_layer(cell: Cell, axis: int) -> tuple[int, int]:
     return tuple(index[i] for i in range(3) if i != 2 - axis)
 
 
+MAX_TOLERANCE = 100       # percent of the distance between black and white
+
+
+def similar_mask(voxels: np.ndarray, palette: np.ndarray, index: int, tolerance: float = 0.0) -> np.ndarray:
+    """Which voxels have the palette color ``index`` (1-based) or one within ``tolerance`` percent of it.
+
+    The distance is the straight distance between the RGB values, as a percentage of the distance from black to
+    white. At 0 only the color itself matches. Empty cells never match.
+    """
+    if tolerance <= 0 or not len(palette):
+        return voxels == index
+    rgb = palette[:, :3].astype(float)
+    distance = np.linalg.norm(rgb - rgb[index - 1], axis=1) / (255.0 * math.sqrt(3.0)) * 100.0
+    allowed = np.concatenate(([False], distance <= tolerance + 1e-9))
+    return allowed[np.minimum(voxels, len(allowed) - 1)]
+
+
 def apply_fill(model: Model, matrix: Matrix, tool: Tool, target: FillTarget,
-               color: tuple[int, int, int, int]) -> int:
+               color: tuple[int, int, int, int], contiguous: bool = True, tolerance: float = 0.0) -> int:
     """Flood fill a matrix. Returns how many voxels changed (0 if none).
 
     * Append: within one layer, the empty cells next to the clicked face that have a solid voxel (of
       any color) behind them, connected to the start cell. A back wall of the matrix counts as solid.
     * Erase: every voxel of the clicked color connected to the clicked voxel in 3D (sharing faces), removed.
-    * Replace: the same 3D region, recolored.
+    * Replace: the same 3D region, recolored. With ``tolerance`` colors close to the clicked one count too, and
+      without ``contiguous`` it is every such voxel in the matrix, not only the ones connected to the clicked voxel.
     """
     voxels = matrix.voxels
     axis = target.axis
@@ -517,8 +708,15 @@ def apply_fill(model: Model, matrix: Matrix, tool: Tool, target: FillTarget,
     clicked = int(voxels[z, y, x])
     if clicked == 0:
         return 0
-    if tool is Tool.FILL_REPLACE and model.find_color(color) == clicked:
-        return 0                                       # already that color: change nothing, add nothing
+    if tool is Tool.FILL_REPLACE:
+        if tolerance <= 0 and model.find_color(color) == clicked:
+            return 0                                   # already that color: change nothing, add nothing
+        matches = similar_mask(voxels, model.palette, clicked, tolerance)
+        region = flood_region_3d(matches, target.cell) if contiguous else matches
+        new = model.index_for_color(color)
+        region = region & (voxels != new)
+        voxels[region] = new
+        return int(region.sum())
     region = flood_region_3d(voxels == clicked, target.cell)
-    voxels[region] = 0 if tool is Tool.FILL_ERASE else model.index_for_color(color)
+    voxels[region] = 0
     return int(region.sum())

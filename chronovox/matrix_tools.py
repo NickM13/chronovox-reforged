@@ -8,6 +8,9 @@ an outline and applies when you let go. Finishing a drag returns an undo entry.
 With several matrices selected, Move moves all of them by the same amount and Rotate swings all of them
 about the center of the selection (the average of their centers); Resize still works on the active one.
 
+The Origin tool uses the same handles as Move, but they carry the pivot of the active matrix and leave the
+matrix where it is (the position is adjusted to make up for it). It always acts on the active matrix alone.
+
 Movement is fine by default (any 1/128 voxel) and snaps to whole voxels while ``snap`` is
 held; rotation snaps to 15 degree steps. Move handles run along the world axes (and a small square between each pair of axes moves in that plane),
 rotation rings
@@ -145,15 +148,21 @@ class MatrixTools:
     def handle_length(anchor, eye) -> float:
         return max(float(np.linalg.norm(np.asarray(anchor, float) - np.asarray(eye, float))) * HANDLE_SCALE, 0.5)
 
+    def _anchor(self, matrix: Matrix, anchor):
+        """Where the handles sit: the pivot of the active matrix, or the given point (never for the Origin tool)."""
+        if anchor is None or self.tool is MatrixTool.PIVOT:
+            return pivot_world(matrix)
+        return np.asarray(anchor, float)
+
     def candidates(self, matrix: Matrix, eye, anchor=None) -> list[tuple[Key, np.ndarray]]:
         """Pickable handles of the current tool as (key, polyline) pairs.
 
         ``anchor`` is where the move and rotate handles sit; by default the active matrix's pivot.
         """
-        anchor = pivot_world(matrix) if anchor is None else np.asarray(anchor, float)
+        anchor = self._anchor(matrix, anchor)
         length = self.handle_length(anchor, eye)
         out = []
-        if self.tool is MatrixTool.MOVE:
+        if self.tool in (MatrixTool.MOVE, MatrixTool.PIVOT):
             for a in range(3):
                 out.append((("axis", a), np.array([anchor, anchor + np.array(AXES[a]) * length])))
             for a in range(3):                                  # after the axes, which win where they overlap
@@ -189,7 +198,7 @@ class MatrixTools:
         origin, direction = ray
         state = (matrix.position, matrix.pivot, matrix.rotation)
         kind = key[0]
-        anchor = pivot_world(matrix) if anchor is None else np.asarray(anchor, float)
+        anchor = self._anchor(matrix, anchor)
         if kind == "axis":
             axis = np.array(AXES[key[1]])
             t0 = closest_param_on_line(origin, direction, anchor, axis)
@@ -219,7 +228,9 @@ class MatrixTools:
             if t0 is None:
                 return False
             self.drag = GizmoDrag(MatrixTool.RESIZE, key, matrix, state, face, axis, t0=t0, sign=sign)
-        if self.drag.tool is not MatrixTool.RESIZE:
+        if self.tool is MatrixTool.PIVOT:
+            self.drag.tool = MatrixTool.PIVOT
+        elif self.drag.tool is not MatrixTool.RESIZE:
             self.drag.others = [o for o in others if o is not matrix]
             self.drag.other_states = [(o.position, o.pivot, o.rotation) for o in self.drag.others]
         return True
@@ -231,7 +242,7 @@ class MatrixTools:
             return False
         origin, direction = ray
         m = drag.matrix
-        if drag.tool is MatrixTool.MOVE:
+        if drag.tool in (MatrixTool.MOVE, MatrixTool.PIVOT):
             if drag.key[0] == "plane":
                 point = ray_plane_point(origin, direction, drag.anchor, drag.direction)
                 if point is None:
@@ -242,10 +253,15 @@ class MatrixTools:
                 if t is None:
                     return False
                 offsets = {drag.key[1]: t - drag.t0}
+            if drag.tool is MatrixTool.PIVOT:
+                changed = self._drag_pivot(m, drag, offsets, snap)
+                drag.changed = drag.changed or changed
+                return changed
             position = list(drag.start_state[0])
+            grid = POSITION_SCALE * m.cell_size             # snapping goes by one voxel of this matrix, not a whole unit
             for axis, offset in offsets.items():
                 value = drag.start_state[0][axis] + offset * POSITION_SCALE
-                position[axis] = int(round(value / POSITION_SCALE) * POSITION_SCALE if snap else round(value))
+                position[axis] = int(round(round(value / grid) * grid) if snap else round(value))
             changed = tuple(position) != m.position
             m.position = tuple(position)
             moved = [p - p0 for p, p0 in zip(m.position, drag.start_state[0])]  # the others move by the same amount
@@ -275,6 +291,29 @@ class MatrixTools:
             changed = cells != drag.cells
             drag.cells = cells
         drag.changed = drag.changed or changed
+        return changed
+
+    @staticmethod
+    def _drag_pivot(m: Matrix, drag: GizmoDrag, offsets: dict, snap: bool) -> bool:
+        """Move the pivot by the world offsets (units, per axis) from where the drag began, keeping the matrix in place.
+
+        A pivot step of d cells along the matrix's own axes moves the pivot point by f R d in the world, so the wanted
+        world offset becomes R^T offset / f cells. With ``snap`` the pivot lands on a whole cell.
+        """
+        position0, pivot0, _ = drag.start_state
+        world = np.zeros(3)
+        for axis, offset in offsets.items():
+            world[axis] = offset
+        rotation = transform.to_matrix(m.rotation)
+        pivot = np.asarray(pivot0, float) / POSITION_SCALE + rotation.T @ world / m.cell_size   # in cells
+        if snap:
+            pivot = np.round(pivot)
+        new_pivot = tuple(int(round(v * POSITION_SCALE)) for v in pivot)
+        delta = POSITION_SCALE * m.cell_size * (np.eye(3) - rotation) @ (
+            (np.asarray(pivot0, float) - np.asarray(new_pivot, float)) / POSITION_SCALE)
+        new_position = tuple(int(round(p + d)) for p, d in zip(position0, delta))
+        changed = new_pivot != m.pivot or new_position != m.position
+        m.pivot, m.position = new_pivot, new_position
         return changed
 
     def end_drag(self, commit: bool) -> tuple[TransformEdit | ResizeEdit | GroupEdit | None, str | None]:
@@ -315,6 +354,9 @@ class MatrixTools:
         if drag is None:
             return ""
         m = drag.matrix
+        if drag.tool is MatrixTool.PIVOT:
+            return "Origin " + ", ".join(f"{(p - n * POSITION_SCALE / 2) / POSITION_SCALE:.3f}"
+                                         for p, n in zip(m.pivot, m.size)) + " from center"
         if drag.tool is MatrixTool.MOVE:
             return "Position " + ", ".join(f"{p / POSITION_SCALE:.4f}" for p in m.position)
         if drag.tool is MatrixTool.ROTATE:
@@ -329,10 +371,10 @@ class MatrixTools:
 
         A square is faintly tinted, and a little more while the mouse is over it or it is being dragged.
         """
-        if self.tool not in (MatrixTool.MOVE, MatrixTool.RESIZE):
+        if self.tool not in (MatrixTool.MOVE, MatrixTool.RESIZE, MatrixTool.PIVOT):
             return np.zeros((0, 3, 3), np.float32), np.zeros((0, 4), np.float32)
         active = self.drag.key if self.drag else self.hover
-        anchor = pivot_world(matrix) if anchor is None else np.asarray(anchor, float)
+        anchor = self._anchor(matrix, anchor)
         length = self.handle_length(anchor, eye)
         triangles, colors = [], []
         if self.tool is MatrixTool.RESIZE:             # the resize handles end in small solid boxes
@@ -363,7 +405,7 @@ class MatrixTools:
             colors.append(color)
 
         active = self.drag.key if self.drag else self.hover
-        anchor = pivot_world(matrix) if anchor is None else np.asarray(anchor, float)
+        anchor = self._anchor(matrix, anchor)
         length = self.handle_length(anchor, eye)
 
         for key, points in self.candidates(matrix, eye, anchor):

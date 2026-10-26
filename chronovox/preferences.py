@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 VERSION = 1
+DEFAULT_EXPLORER_WIDTH = 390.0   # the sidebar; it was 260 before, and a saved 260 is taken as "never resized"
+OLD_EXPLORER_WIDTH = 260.0
 MAX_RECENT = 100   # how many recently opened models are remembered
 
 MIN_WINDOW = (480, 320)
@@ -81,7 +83,7 @@ class Preferences:
     recent_view: str = "list"        # how the home page shows them: "list" or "grid"
     workspace_url: str = ""          # the shared workspace server the login form starts with
     explorer_csm: bool = False       # the Files panel also lists legacy .csm models
-    explorer_width: float = 260.0    # how wide the Files sidebar is when open
+    explorer_width: float = DEFAULT_EXPLORER_WIDTH    # how wide the Explorer sidebar is when open
     right_dock_width: float = 340.0  # the docked Model and Tools panels on the right
     right_dock_split: float = 0.4    # how much of their height the Model panel gets
     explorer_visible: bool = True    # the Files panel
@@ -146,7 +148,7 @@ class Preferences:
         d.explorer_visible = _bool(data.get("explorer_visible") if isinstance(data, dict) else None, d.explorer_visible)
         width = data.get("explorer_width") if isinstance(data, dict) else None
         if _is_number(width) and 100 <= width <= 4000:
-            d.explorer_width = float(width)
+            d.explorer_width = DEFAULT_EXPLORER_WIDTH if float(width) == OLD_EXPLORER_WIDTH else float(width)
         dock = _section(data, "right_dock")
         if _is_number(dock.get("width")) and 150 <= dock["width"] <= 4000:
             d.right_dock_width = float(dock["width"])

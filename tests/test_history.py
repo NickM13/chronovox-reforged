@@ -166,3 +166,19 @@ def test_every_edit_kind_can_describe_itself():
     assert "voxel change" in VoxelEdit(m, np.array([0], np.uint32), np.array([0], np.uint16), np.array([1], np.uint16)).describe()
     assert "transform" in TransformEdit(m, (), ()).describe()
     assert "size" in ResizeEdit(m, m.voxels, m.voxels, (), ()).describe()
+
+
+def test_palette_edit_recolors_the_entry_and_undoes_exactly():
+    import numpy as np
+    from chronovox.history import History, PaletteEdit
+    from chronovox.model import Model
+    model = Model(np.array([[10, 20, 30, 255], [1, 2, 3, 200]], np.uint8), [])
+    history = History()
+    edit = PaletteEdit(model, 1, (1, 2, 3, 200), (9, 8, 7, 200))
+    edit.redo()
+    history.push(edit)
+    assert model.palette[1].tolist() == [9, 8, 7, 200] and model.palette[0].tolist() == [10, 20, 30, 255]
+    history.undo().undo()
+    assert model.palette[1].tolist() == [1, 2, 3, 200]
+    history.redo().redo()
+    assert model.palette[1].tolist() == [9, 8, 7, 200]

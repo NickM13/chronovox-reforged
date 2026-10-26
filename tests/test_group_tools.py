@@ -238,3 +238,34 @@ def test_the_tinted_fill_follows_the_same_quadrant_as_the_outline():
     triangles, _ = tools.fills(m, eye)
     outline = dict((key, pts) for key, pts in tools.candidates(m, eye))[("plane", 2)][:4]
     assert np.allclose(np.sort(triangles[4:6].reshape(-1, 3), axis=0)[[0, -1]], np.sort(outline, axis=0)[[0, -1]])
+
+
+def test_origin_tool_moves_the_pivot_and_leaves_the_matrix_where_it_is():
+    from chronovox.matrix_tools import model_point
+    m = mat("a", 0, size=(4, 4, 4), rotation=transform.from_axis_angle((0.0, 1.0, 0.0), 0.7))
+    tools = MatrixTools()
+    start = (m.position, m.pivot)
+    before = model_point(m.position, m.pivot, m.rotation, (1.0, 2.0, 3.0), m.cell_size)
+    anchor = pivot_world(m)
+    grab(tools, MatrixTool.PIVOT, ("axis", 0), ray_along_z(anchor[0], anchor[1]), m, [], None)
+    assert tools.update_drag(ray_along_z(anchor[0] + 1.0, anchor[1]), snap=False)
+    assert m.pivot != start[1]
+    after = model_point(m.position, m.pivot, m.rotation, (1.0, 2.0, 3.0), m.cell_size)
+    assert np.allclose(before, after, atol=0.02)               # the matrix has not visibly moved
+    edit, error = tools.end_drag(True)
+    assert error is None and edit is not None and m.pivot != start[1]
+    edit.undo()
+    assert (m.position, m.pivot) == start
+
+
+def test_snapping_a_move_goes_by_one_voxel_of_the_matrix():
+    m = mat("a", 0)
+    m.resolution = 3                                           # a voxel is a quarter of a unit
+    assert m.cell_size == 0.25
+    tools = MatrixTools()
+    anchor = pivot_world(m)
+    grab(tools, MatrixTool.MOVE, ("axis", 0), ray_along_z(anchor[0], anchor[1]), m, [], None)
+    tools.update_drag(ray_along_z(anchor[0] + 0.3, anchor[1]), snap=True)
+    assert m.position[0] == 32                                 # 0.3 units goes to 0.25, a quarter-unit voxel
+    tools.update_drag(ray_along_z(anchor[0] + 0.4, anchor[1]), snap=True)
+    assert m.position[0] == 64                                 # and 0.4 to 0.5

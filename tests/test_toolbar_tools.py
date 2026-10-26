@@ -9,7 +9,7 @@ def test_every_tool_maps_to_its_own_action_and_brush_and_back():
 
 
 def test_the_toolbox_order():
-    assert [t.value for t in VOXEL_TOOLS] == ["Place", "Erase", "Paint", "Pick color", "Box select", "Wand select", "Fill"]
+    assert [t.value for t in VOXEL_TOOLS] == ["Place", "Erase", "Replace", "Pick color", "Box select", "Wand select", "Fill"]
 
 
 def test_a_box_brush_counts_as_the_single_voxel_tool():

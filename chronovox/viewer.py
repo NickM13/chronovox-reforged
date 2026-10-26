@@ -5,6 +5,7 @@ Window and input via glfw, drawing via moderngl, UI via Dear ImGui (imgui-bundle
 from __future__ import annotations
 
 import math
+import shutil
 import struct
 import time
 import zlib
@@ -24,10 +25,10 @@ from .camera import Camera
 from .gizmos import MatrixTool, Mode
 from . import grid as ground_grid
 from .editing import (FILL_FOR_ACTION, FILL_TOOLS, TOOL_PARTS, VOXEL_TOOLS, Brush, FillTarget, Tool, VoxelTool, apply_box,
-                      apply_fill, apply_tool, cell_after_expansion, effective_tool, expansion_for, find_target,
-                      pick_fill, place_face, raycast, voxel_tool_for)
-from .toolbar import ToolButton, push_selected_colors, tool_strip
-from .history import (GroupEdit, History, MatrixListEdit, MatrixMoveEdit, MergeEdit, ReorientEdit, SelectionEdit,
+                      apply_fill, apply_tool, cell_after_expansion, effective_tool, symmetric_expansion, find_target,
+                      MAX_TOLERANCE, apply_cells, mirror_boxes, pick_fill, symmetric_box_cells, symmetric_cells, symmetric_targets, place_face, raycast, voxel_tool_for)
+from .toolbar import ToolButton, icon_button, push_selected_colors, set_images, tool_strip
+from .history import (GroupEdit, History, MatrixListEdit, MatrixMoveEdit, MergeEdit, PaletteEdit, ReorientEdit, SelectionEdit,
                       VoxelEdit)
 from .mesh import Mesh, build_mesh
 from . import transform as xf
@@ -37,13 +38,14 @@ from .matrix_tools import MatrixTools, group_anchor, pick_matrix, to_local
 from .model import MAX_RESOLUTION, POSITION_SCALE, Matrix, Model
 from .info_bar import fit_text, matrix_summary
 from . import explorer, filemanager, trash
+from .icons import IconSet
 from .recent import add_recent, remove_recent
 from .tabs import Tab, tab_label
 from . import selection as voxsel
 from .workspace_ui import WorkspacePanel
 from .transfer import copy_matrix, group_shift, import_colors
 from . import __version__
-from .preferences import Preferences
+from .preferences import DEFAULT_EXPLORER_WIDTH, Preferences
 from .ui_fields import NumberFields, ctrl_down, shift_down
 
 VERTEX_SHADER = """
@@ -168,15 +170,15 @@ KEYBIND_SECTIONS = (
     ("Camera", CAMERA_CONTROLS),
     ("General", (
         ("Tab", "Switch between Voxel and Matrix mode"),
-        ("T / E / R / K", "Voxel tools: place, erase, paint (replace color), pick color"),
+        ("T / E / R / K", "Voxel tools: place, erase, replace (recolor), pick color"),
         ("S", "Select: box select; press again for wand select"),
         ("F", "Fill; press again to switch between append and replace"),
-        ("W / E / R", "Matrix tools: move, rotate, resize"),
-        ("1 - 7 / 1 - 3", "The same tools by their place in the toolbox (Voxel mode / Matrix mode)"),
+        ("W / E / R / G", "Matrix tools: move, rotate, resize, origin (pivot)"),
+        ("1 - 7 / 1 - 4", "The same tools by their place in the toolbox (Voxel mode / Matrix mode)"),
         ("Shift (held)", "Place, paint and erase drag out a box"),
         ("P", "Preview mode"),
         ("Home", "Frame the whole model"),
-        ("Space", "Focus on the selected matrix"),
+        ("Space", "Focus on the voxel under the cursor, else the selected matrix"),
         ("Ctrl+B", "Show or fold the Explorer sidebar"),
         ("Ctrl+Z / Ctrl+Y", "Undo / redo (Ctrl+Shift+Z also redoes)"),
         ("Ctrl+N / O / S", "New / open / save (Shift+S: save as)"),
@@ -197,6 +199,7 @@ KEYBIND_SECTIONS = (
     )),
     ("Voxel selection", (
         ("Ctrl+C / X / V", "Copy / cut / paste"),
+        ("Ctrl+Shift+V", "Paste matrices at the camera focus instead of where they were copied from"),
         ("X / Y / Z", "Flip the selection (Shift: turn it)"),
         ("Arrows, PgUp / PgDn", "Nudge the selection"),
         ("Delete", "Delete the selected voxels"),
@@ -385,6 +388,12 @@ class Viewer:
         glfw.swap_interval(1)
 
         self.ctx = moderngl.create_context()
+        self.icons = IconSet(self.ctx)                # the picture icons from assets/icons
+        # The picture icons are in the project but off for now: the tools and buttons use the icons drawn in code.
+        # Turn this on to use the pictures (a name with no file still falls back to its drawn icon).
+        self.picture_icons = False
+        if self.picture_icons:
+            set_images(self.icons)
         self.prog = self.ctx.program(vertex_shader=VERTEX_SHADER, fragment_shader=FRAGMENT_SHADER)
         self.prog["u_shade_base"].value = shading.BASE
         self.prog["u_shade_weights"].value = shading.WEIGHTS
@@ -434,6 +443,12 @@ class Viewer:
         self._last_cursor = glfw.get_cursor_pos(self.window)
         self._keys_down: set[int] = set()
         self._lmb_was_down = False
+        self.mirror = [False, False, False]             # edits are repeated across the center plane of each enabled axis
+        self.radial_on = False                          # ... and turned around the center of the matrix, around radial_axis,
+        self.radial_axis = 1                            # radial_count copies to a full turn
+        self.radial_count = 4
+        self.fill_contiguous = True       # Replace fill and the wand take only voxels connected to the clicked one (True) or all
+        self.fill_tolerance = 0           # ... and colors within this many percent of the clicked color count too
         self.fill_replace = False         # the Fill tool recolors a region (True) or fills against a face (False)
         self.action = Tool.PLACE          # what a click does: Place, Erase, Paint or Pick
         self.brush = Brush.VOXEL          # how it is applied: one voxel at a time, a box, or a flood fill
@@ -489,6 +504,9 @@ class Viewer:
         self.explorer_roots = list(prefs.explorer_roots)
         self.explorer_expanded = set(prefs.explorer_expanded)
         self.explorer_filter = ""
+        self._recolor_rgb = [0.0, 0.0, 0.0]            # the color being picked in the palette's Recolor popup
+        self._clone_source: str | None = None         # a model the Explorer asked to clone, waiting for a name
+        self._clone_name = ""
         self._delete_candidate: str | None = None     # a model the Explorer asked to delete, waiting for the answer
         self.sidebar_tab = "explorer"                # which tab of the sidebar shows: "explorer" or "workspace"
         self._sidebar_tab_request: str | None = None # a tab to switch to by program (the Workspace menu)
@@ -744,8 +762,7 @@ class Viewer:
         """Park the current model's state in its tab, so another tab can be loaded."""
         tab = self.tabs[self.current]
         tab.model, tab.items, tab.path, tab.suggested_name = self.model, self.items, self.path, self.suggested_name
-        tab.active, tab.history, tab.dirty, tab.camera, tab.mode = (
-            self.active, self.history, self.dirty, self.camera, self.mode)
+        tab.active, tab.history, tab.dirty, tab.camera = self.active, self.history, self.dirty, self.camera
         tab.voxel_selection = self.vsel
         tab.selection = self.selection
 
@@ -753,8 +770,8 @@ class Viewer:
         self.current = index
         tab = self.tabs[index]
         self.model, self.items, self.path, self.suggested_name = tab.model, tab.items, tab.path, tab.suggested_name
-        self.active, self.history, self.dirty, self.camera, self.mode = (
-            tab.active, tab.history, tab.dirty, tab.camera, tab.mode)
+        # The mode and the chosen tool belong to the editor, not to a tab: they stay as they are when tabs change.
+        self.active, self.history, self.dirty, self.camera = tab.active, tab.history, tab.dirty, tab.camera
         self.vsel = tab.voxel_selection
         self.sel_drag = None
         self._voxel_generation += 1
@@ -856,13 +873,13 @@ class Viewer:
         self.clipboard = holder
         self.clip_kind = "matrices"
         what = holder.matrices[0].name if len(indices) == 1 else f"{len(indices)} matrices"
-        self.status = f"Copied {what}. Ctrl+V pastes at the camera focus."
+        self.status = f"Copied {what}. Ctrl+V pastes in place, Ctrl+Shift+V at the camera focus."
         return True
 
-    def paste_matrix(self) -> bool:
-        """Add the clipboard's matrices to the current model, their common center on the camera focus.
+    def paste_matrix(self, at_focus: bool = False) -> bool:
+        """Add the clipboard's matrices to the current model, where they were copied from.
 
-        One undo step. The pasted matrices become the selection. If any of them cannot be added nothing is.
+        With ``at_focus`` their common center goes on the camera focus instead. One undo step. The pasted matrices become the selection. If any of them cannot be added nothing is.
         """
         if self.model is None or self._busy() or self.clipboard is None:
             return False
@@ -877,9 +894,10 @@ class Viewer:
                 self.model.remove_matrix(copy)
             self.status = f"Cannot paste: {exc}"
             return False
-        shift = group_shift(copies, tuple(self.camera.target))
-        for copy in copies:
-            copy.position = tuple(p + d for p, d in zip(copy.position, shift))
+        if at_focus:
+            shift = group_shift(copies, tuple(self.camera.target))
+            for copy in copies:
+                copy.position = tuple(p + d for p, d in zip(copy.position, shift))
         self.history.push(edits[0] if len(edits) == 1 else GroupEdit(f"paste of {len(edits)} matrices", edits))
         self._sync_items()
         self.active = self.model.matrices.index(copies[0])
@@ -1101,6 +1119,17 @@ class Viewer:
         self.camera.focus_on(glm.vec3(*group_anchor(chosen)))
         self.status = f"Focus on {chosen[0].name}" if len(chosen) == 1 else f"Focus on {len(chosen)} selected matrices"
 
+    def focus_hovered_voxel(self) -> bool:
+        """In voxel mode, make the center of the voxel under the cursor the point the camera orbits. False if none is."""
+        item = self._hover_item()
+        if self.mode is not Mode.VOXEL or self.hover is None or item is None:
+            return False
+        center = item.transform * glm.vec4(*(c + 0.5 for c in self.hover), 1.0)
+        self.camera.focus_on(glm.vec3(center))
+        x, y, z = self.hover
+        self.status = f"Focus on cell {x}, {y}, {z}"
+        return True
+
     def add_matrix(self, size: tuple[int, int, int], name: str | None = None, resolution: int = 1) -> bool:
         """Add an empty matrix centered on the camera focus and make it active."""
         if self.model is None:
@@ -1317,12 +1346,37 @@ class Viewer:
     def active_item(self) -> DrawItem | None:
         return self.items[self.active] if 0 <= self.active < len(self.items) else None
 
+    @property
+    def radial(self) -> tuple[int, int] | None:
+        """(axis, copies) while radial symmetry is on and makes copies, else None."""
+        return (self.radial_axis, self.radial_count) if self.radial_on and self.radial_count > 1 else None
+
     def brush_rgba(self) -> tuple[int, int, int, int]:
         return (*self.color, 255)
 
     def select_palette_color(self, index: int) -> None:
         """Make the palette color with this 1-based index the brush color."""
         self.color = tuple(int(c) for c in self.model.palette[index - 1][:3])
+
+    def recolor_palette_color(self, index: int, rgb: tuple[int, int, int]) -> bool:
+        """Change the palette color with this 1-based index to ``rgb``, which recolors every voxel that uses it."""
+        if self.model is None or not 1 <= index <= len(self.model.palette):
+            return False
+        old = tuple(int(c) for c in self.model.palette[index - 1])
+        new = (*rgb, old[3])
+        if new == old:
+            return False
+        was_brush = self.model.find_color(self.brush_rgba()) == index
+        edit = PaletteEdit(self.model, index - 1, old, new)
+        edit.redo()
+        self.history.push(edit)
+        for i in range(len(self.items)):
+            self._rebuild_item(i)
+        if was_brush:
+            self.color = tuple(rgb)
+        self.dirty = True
+        self.status = f"Recolored palette color {index}"
+        return True
 
     def _apply(self, tool: Tool, cell: tuple[int, int, int]) -> bool:
         """Apply a tool to the active matrix without rebuilding. True if voxels changed."""
@@ -1335,11 +1389,13 @@ class Viewer:
             if index:
                 self.select_palette_color(index)
             return False
+        changed = False
         try:
-            return apply_tool(self.model, item.matrix, tool, cell, self.brush_rgba())
+            for target in symmetric_cells(cell, item.matrix.size, tuple(self.mirror), self.radial):
+                changed |= apply_tool(self.model, item.matrix, tool, target, self.brush_rgba())
         except ValueError as exc:
             self.status = str(exc)
-            return False
+        return changed
 
     def _commit(self) -> None:
         self.dirty = True
@@ -1350,9 +1406,15 @@ class Viewer:
         item = self.active_item()
         if item is None:
             return
+        if (any(self.mirror) or self.radial) and tool is not Tool.PICK:
+            before = item.matrix.voxels.copy()               # several voxels change: record the difference
+            if self._apply(tool, cell):
+                self._record(item.matrix, before)
+                self._commit()
+            return
         x, y, z = cell
         inside = all(0 <= c < n for c, n in zip(cell, item.matrix.size))
-        old = int(item.matrix.voxels[z, y, x]) if inside else 0
+        old =int(item.matrix.voxels[z, y, x]) if inside else 0
         if self._apply(tool, cell):
             new = int(item.matrix.voxels[z, y, x])
             flat = np.ravel_multi_index((z, y, x), item.matrix.voxels.shape)
@@ -1374,7 +1436,10 @@ class Viewer:
             item = self.active_item()
         before = item.matrix.voxels.copy()
         try:
-            changed = apply_fill(self.model, item.matrix, self.tool, target, self.brush_rgba())
+            changed = 0
+            for each in symmetric_targets(target, item.matrix.size, tuple(self.mirror), self.radial):
+                changed += apply_fill(self.model, item.matrix, self.tool, each, self.brush_rgba(),
+                                      self.fill_contiguous, self.fill_tolerance)
         except ValueError as exc:   # palette full
             changed = 0
             self.status = str(exc)
@@ -1555,11 +1620,12 @@ class Viewer:
             return self.copy_selection()
         return self.copy_selected_matrix()
 
-    def paste(self) -> bool:
-        """Ctrl+V: whatever was copied last, voxels or matrices."""
+    def paste(self, at_focus: bool = False) -> bool:
+        """Ctrl+V: whatever was copied last, voxels or matrices. Matrices go where they were copied from, or with
+        ``at_focus`` (Ctrl+Shift+V) to the camera focus."""
         if self.clip_kind == "voxels" and self.voxel_clip is not None:
             return self.paste_voxels()
-        return self.paste_matrix()
+        return self.paste_matrix(at_focus)
 
     def can_paste(self) -> bool:
         if self.clip_kind == "voxels":
@@ -1643,7 +1709,7 @@ class Viewer:
                 if not shift:
                     self.deselect()
                 return
-            chosen = voxsel.wand_mask(voxels, hit.cell)
+            chosen = voxsel.wand_mask(voxels, hit.cell, self.model.palette, self.fill_contiguous, self.fill_tolerance)
             self.set_selection(chosen | mask if (shift and mask is not None) else chosen)
             self.status = f"Selected {self.selection_count():,} voxels"
             return
@@ -1710,13 +1776,13 @@ class Viewer:
             self._rebuild_item(self.active)
 
     def _expand_for(self, cell: tuple[int, int, int]):
-        """Grow the active matrix by one cell on the side a target cell lies beyond.
+        """Grow the active matrix by one cell on each side a target cell, or a mirrored or turned copy of it, lies beyond.
 
         Returns (the edit that did it, the target's cell in the grown matrix), or (None, None) if it could not grow. The
         edit is not in the history yet: it is recorded together with the voxels placed, as one undo step.
         """
         matrix = self.active_item().matrix
-        grow = expansion_for(cell, matrix.size)
+        grow = symmetric_expansion(cell, matrix.size, tuple(self.mirror), self.radial)
         if grow is None:
             return None, cell
         try:
@@ -1728,7 +1794,11 @@ class Viewer:
         return edit, cell_after_expansion(cell, grow[0])
 
     def _outside(self, cell, matrix: Matrix) -> bool:
-        return cell is not None and not all(0 <= c < n for c, n in zip(cell, matrix.size))
+        """Whether the cell, or a mirrored or turned copy of it, lies beyond the matrix: it has to grow to take it."""
+        if cell is None:
+            return False
+        return any(not all(0 <= c < n for c, n in zip(copy, matrix.size))
+                   for copy in symmetric_cells(cell, matrix.size, tuple(self.mirror), self.radial))
 
     def _record(self, matrix: Matrix, before: np.ndarray, prefix=None) -> None:
         """Add one undo step for everything that changed in a matrix since ``before`` was copied.
@@ -1792,6 +1862,9 @@ class Viewer:
             self._sync_items()
             present = [i for i, m in enumerate(self.model.matrices) if m is edit.matrix]
             self.active = present[0] if present else max(0, min(edit.index, len(self.items) - 1))
+        elif isinstance(edit, PaletteEdit):
+            for i in range(len(self.items)):
+                self._rebuild_item(i)                              # the meshes carry the colors
         else:
             for i, item in enumerate(self.items):
                 if item.matrix is edit.matrix:
@@ -2325,7 +2398,9 @@ class Viewer:
         shift = self._key(glfw.KEY_LEFT_SHIFT, glfw.KEY_RIGHT_SHIFT)
         interrupted = item is None or self._drag is not None or alt
         if self.box is not None:
-            if interrupted or self._key(glfw.KEY_ESCAPE):
+            # A right click (look, or zoom with Alt) leaves the box alone; other camera drags and Alt cancel it.
+            right_drag = self._drag in ("look", "zoom") and not alt
+            if (interrupted and not (right_drag and item is not None)) or self._key(glfw.KEY_ESCAPE):
                 self._cancel_box(item)
             elif not lmb:
                 self._finish_box(item)
@@ -2386,10 +2461,20 @@ class Viewer:
         box = self.box
         item.matrix.voxels[...] = box.base
         try:
-            apply_box(self.model, item.matrix, box.tool, *box.corners(), self.brush_rgba(), box.only_color)
+            self._apply_box(item, box)
         except ValueError as exc:
             self.status = str(exc)
         self._rebuild_item(self.active)
+
+    def _apply_box(self, item: DrawItem, box: BoxDrag) -> bool:
+        """Apply a box drag, and its reflections across the mirror planes."""
+        changed = False
+        if self.radial:
+            cells = symmetric_box_cells(*box.corners(), item.matrix.size, tuple(self.mirror), self.radial)
+            return apply_cells(self.model, item.matrix, box.tool, cells, self.brush_rgba(), box.only_color)
+        for a, b in mirror_boxes(*box.corners(), item.matrix.size, tuple(self.mirror)):
+            changed |= apply_box(self.model, item.matrix, box.tool, a, b, self.brush_rgba(), box.only_color)
+        return changed
 
     def _cancel_box(self, item: DrawItem | None) -> None:
         box, self.box = self.box, None
@@ -2408,8 +2493,7 @@ class Viewer:
                 self._record(item.matrix, box.base)
             return
         try:
-            changed = apply_box(self.model, item.matrix, box.tool, *box.corners(), self.brush_rgba(),
-                                box.only_color)
+            changed = self._apply_box(item, box)
         except ValueError as exc:
             self.status = str(exc)
             return
@@ -2512,6 +2596,7 @@ class Viewer:
         c_key = self._pressed_once(glfw.KEY_C)
         v_key = brush_keys[0]          # V is also the Voxel brush key: a key press can only be read once per frame
         w = self._pressed_once(glfw.KEY_W)
+        g_key = self._pressed_once(glfw.KEY_G)
         coarser, finer = self._pressed_once(glfw.KEY_LEFT_BRACKET), self._pressed_once(glfw.KEY_RIGHT_BRACKET)
         if typing:
             return
@@ -2524,7 +2609,8 @@ class Viewer:
         if f2:
             self.start_rename()
         if space and not ctrl:
-            self.focus_active_matrix()
+            if not self.focus_hovered_voxel():
+                self.focus_active_matrix()
         if ctrl and o:
             self._choose_file()
         elif ctrl and s_:
@@ -2536,7 +2622,7 @@ class Viewer:
         elif ctrl and c_key:
             self.copy_selected()
         elif ctrl and v_key:
-            self.paste()
+            self.paste(at_focus=shift)
         elif ctrl and x_key and self.selection_visible():
             self.cut_selection()
         elif ctrl and a_key:
@@ -2572,7 +2658,8 @@ class Viewer:
                     if pressed:
                         self.set_voxel_tool(tool)
             elif self.matrix_tools.drag is None:
-                for tool, pressed in ((MatrixTool.MOVE, w), (MatrixTool.RESIZE, r_key), (MatrixTool.ROTATE, e_key)):
+                for tool, pressed in ((MatrixTool.MOVE, w), (MatrixTool.RESIZE, r_key), (MatrixTool.ROTATE, e_key),
+                                  (MatrixTool.PIVOT, g_key)):
                     if pressed:
                         self.matrix_tools.tool = tool
                 for tool, pressed in zip(MatrixTool, digits):
@@ -2668,6 +2755,8 @@ class Viewer:
                 self.cut_selection()
             if imgui.menu_item("Paste", "Ctrl+V", False, self.can_paste())[0]:
                 self.paste()
+            if imgui.menu_item("Paste at camera focus", "Ctrl+Shift+V", False, self.can_paste())[0]:
+                self.paste(at_focus=True)
             if imgui.begin_menu("Selection", has_matrix and self.mode is Mode.VOXEL):
                 if imgui.menu_item("Select all voxels", "", False)[0]:
                     self.select_all()
@@ -2737,7 +2826,7 @@ class Viewer:
                 self.explorer_visible = not self.explorer_visible
             if imgui.menu_item("Reset window layout", "", False)[0]:
                 self._reset_layout = True
-                self.explorer_width = 260.0
+                self.explorer_width = DEFAULT_EXPLORER_WIDTH
                 self.right_width, self.right_split = DEFAULT_RIGHT_WIDTH, DEFAULT_RIGHT_SPLIT
             imgui.end_menu()
         if imgui.begin_menu("Workspace"):
@@ -2884,7 +2973,7 @@ class Viewer:
             row_actions = []
             picked_rows = set(self.selected_indices())
             fh, gap = imgui.get_frame_height(), imgui.get_style().item_spacing.y
-            footer = 2 * fh + 3 * gap + 2                                         # the buttons and the resolution row
+            footer = (max(fh, 28.0) if self.picture_icons else fh) + fh + 3 * gap + 2   # the buttons and the resolution row
             imgui.begin_child("##matrixlist", imgui.ImVec2(0, max(imgui.get_content_region_avail().y - footer, 60.0)))
             # The checkboxes and resolution boxes keep their usual spacing, but the name is as tall as the whole row, spacing
             # included, as if it had inner padding: the names touch, and there is no strip between two of them that
@@ -2993,15 +3082,16 @@ class Viewer:
                 self.set_matrix_resolution(item, level)
             for action, index in row_actions:           # also after the loop: they change the list
                 self.clone_matrix(index) if action == "clone" else self.delete_matrix(index)
-            if imgui.button("New"):
+            button_height = max(imgui.get_frame_height(), 28.0) if self.picture_icons else imgui.get_frame_height()
+            if imgui.button("New", imgui.ImVec2(0, button_height)):
                 self.show_new_matrix = True
             imgui.same_line()
-            if imgui.button("Delete"):
+            if icon_button("Delete", "delete", button_height):
                 self.delete_matrix()
             imgui.same_line()
             picked = len(self.selected_indices())
             imgui.begin_disabled(picked < 2)
-            if imgui.button(f"Merge ({picked})" if picked > 1 else "Merge"):
+            if icon_button(f"Merge ({picked})" if picked > 1 else "Merge", "merge", button_height):
                 self.merge_selected()
             imgui.end_disabled()
             if imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled):
@@ -3054,6 +3144,26 @@ class Viewer:
                     self.set_fill_replace(replace)
                 if not replace:
                     imgui.same_line()
+        if self.action is not Tool.SELECT and self.action is not Tool.PICK:
+            imgui.text_disabled("Mirror")
+            for axis, name in enumerate("XYZ"):
+                imgui.same_line()
+                _, self.mirror[axis] = imgui.checkbox(f"{name}##mirror", self.mirror[axis])
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip(f"Repeat edits across the center of the matrix along {name}")
+            _, self.radial_on = imgui.checkbox("Radial##radial", self.radial_on)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Repeat edits turned around the center of the matrix, like spokes of a wheel")
+            if self.radial_on:
+                for axis, name in enumerate("XYZ"):
+                    imgui.same_line()
+                    if imgui.radio_button(f"{name}##radial_axis", self.radial_axis == axis):
+                        self.radial_axis = axis
+                imgui.set_next_item_width(90.0)
+                _, count = imgui.input_int("Copies##radial", self.radial_count)
+                self.radial_count = max(2, min(count, 32))
+        if self.brush is Brush.FILL and self.action in (Tool.PAINT, Tool.SELECT):
+            self._draw_match_options()
         self._draw_selection_tools()
         if self.box is not None:
             lo, hi = self.box.corners()
@@ -3124,8 +3234,9 @@ class Viewer:
                     buttons.append(ToolButton(tool, tool.value, self.VOXEL_TOOL_ICONS[tool], f"{self.VOXEL_TOOL_KEYS[tool]}, {number}", ""))
             selected = self.voxel_tool
         else:
-            icons = {MatrixTool.MOVE: "move", MatrixTool.RESIZE: "resize", MatrixTool.ROTATE: "rotate"}
-            letters = {MatrixTool.MOVE: "W", MatrixTool.RESIZE: "R", MatrixTool.ROTATE: "E"}
+            icons = {MatrixTool.MOVE: "move", MatrixTool.RESIZE: "resize", MatrixTool.ROTATE: "rotate",
+                     MatrixTool.PIVOT: "pivot"}
+            letters = {MatrixTool.MOVE: "W", MatrixTool.RESIZE: "R", MatrixTool.ROTATE: "E", MatrixTool.PIVOT: "G"}
             buttons = [ToolButton(tool, tool.value, icons[tool], f"{letters[tool]}, {number}", "")
                        for number, tool in enumerate(MatrixTool, start=1)]
             selected = self.matrix_tools.tool
@@ -3148,6 +3259,16 @@ class Viewer:
                     self.matrix_tools.tool = picked
         imgui.end()
         imgui.pop_style_var(2)
+
+    def _draw_match_options(self) -> None:
+        """What counts as the same for Replace fill and the wand: connected or anywhere, and how close in color."""
+        _, self.fill_contiguous = imgui.checkbox("Contiguous", self.fill_contiguous)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("On: only voxels connected to the clicked one.\nOff: every matching voxel in the matrix.")
+        imgui.set_next_item_width(imgui.get_content_region_avail().x * 0.6)
+        _, self.fill_tolerance = imgui.slider_int("Tolerance", self.fill_tolerance, 0, MAX_TOLERANCE, "%d%%")
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("How different a color may be from the clicked one and still match.\n0 means the same color only.")
 
     def _draw_selection_tools(self) -> None:
         """What can be done with the selected voxels, shown while the Select action is chosen or something is selected."""
@@ -3220,10 +3341,12 @@ class Viewer:
             target = [max(int(n), 1) for n in v]
             self.resize_matrix_by(item, (0, 0, 0), [t - c for t, c in zip(target, m.size)])
 
-        changed, v = self.fields.row("pivot", "Pivot", [p / step for p in m.pivot], step=1.0,
+        # Shown from the middle of the matrix, so 0, 0, 0 is the center; it is stored from the origin corner.
+        middle = [n * step / 2 for n in m.size]
+        changed, v = self.fields.row("pivot", "Pivot", [(p - c) / step for p, c in zip(m.pivot, middle)], step=1.0,
                                      shift_step=1 / POSITION_SCALE, is_float=True, flags=numeric)
         if changed:
-            self.set_matrix_pivot(item, tuple(int(round(c * step)) for c in v))
+            self.set_matrix_pivot(item, tuple(int(round(c * step + mid)) for c, mid in zip(v, middle)))
 
         euler = xf.to_euler(m.rotation)
         changed, v = self.fields.row("rotation", "Rotation", [float(e) + 0.0 for e in euler], step=1.0,
@@ -3283,6 +3406,21 @@ class Viewer:
                     if imgui.color_button("##swatch", imgui.ImVec4(r / 255, g / 255, b / 255, 1), flags,
                                           imgui.ImVec2(18, 18)):
                         self.select_palette_color(i + 1)
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip("Click to use, right click to recolor")
+                        if imgui.is_mouse_released(imgui.MouseButton_.right):
+                            self._recolor_rgb = [r / 255, g / 255, b / 255]
+                            imgui.open_popup("##recolor")
+                    if imgui.begin_popup("##recolor"):
+                        imgui.text(f"Recolor palette color {i + 1}")
+                        _, self._recolor_rgb = imgui.color_picker3("##recolor_picker", self._recolor_rgb)
+                        if imgui.button("Recolor", imgui.ImVec2(90, 0)):
+                            self.recolor_palette_color(i + 1, tuple(int(round(c * 255)) for c in self._recolor_rgb))
+                            imgui.close_current_popup()
+                        imgui.same_line()
+                        if imgui.button("Cancel", imgui.ImVec2(90, 0)):
+                            imgui.close_current_popup()
+                        imgui.end_popup()
                     if i < len(usage) and not usage[i]:
                         self._mark_unused_swatch()
                     if i + 1 == current:
@@ -3630,6 +3768,7 @@ class Viewer:
             imgui.end_tab_bar()
         self._sidebar_tab_request = None
         self._draw_delete_confirm()
+        self._draw_clone_dialog()
         # a thin handle on the right edge: drag it to make the sidebar wider or narrower
         imgui.set_cursor_screen_pos(imgui.ImVec2(width - 5.0, top))
         imgui.invisible_button("##explorer_resize", imgui.ImVec2(5.0, height))
@@ -3674,6 +3813,56 @@ class Viewer:
             self._delete_candidate = None
             imgui.close_current_popup()
         imgui.end_popup()
+
+    def _draw_clone_dialog(self) -> None:
+        """Ask for the name of a copy of a model, which is made in the same folder."""
+        title = "Clone model"
+        if self._clone_source is not None and not imgui.is_popup_open(title):
+            imgui.open_popup(title)
+        source = self._clone_source
+        display = imgui.get_io().display_size
+        imgui.set_next_window_pos(imgui.ImVec2(display.x / 2, display.y / 3), imgui.Cond_.appearing, imgui.ImVec2(0.5, 0.0))
+        if not imgui.begin_popup_modal(title, None, imgui.WindowFlags_.always_auto_resize)[0]:
+            return
+        if source is None:
+            imgui.close_current_popup()
+            imgui.end_popup()
+            return
+        extension = Path(source).suffix
+        imgui.text(Path(source).name)
+        imgui.text_disabled(str(Path(source).parent))
+        if imgui.is_window_appearing():
+            imgui.set_keyboard_focus_here()
+        imgui.set_next_item_width(imgui.get_font_size() * 18)
+        entered, self._clone_name = imgui.input_text(f"{extension}##clone_name", self._clone_name,
+                                                      imgui.InputTextFlags_.enter_returns_true)
+        path, problem = explorer.clone_target(source, self._clone_name)
+        if problem and self._clone_name.strip():
+            imgui.text_colored(imgui.ImVec4(1.0, 0.75, 0.3, 1.0), problem)
+        if explorer.norm(source) in self._open_model_paths():
+            imgui.text_disabled("The copy is made from the file on disk, without unsaved changes in its tab.")
+        imgui.begin_disabled(path is None)
+        make = imgui.button("Clone", imgui.ImVec2(90, 0)) or (entered and path is not None)
+        imgui.end_disabled()
+        if make:
+            self._clone_model_file(source, path)
+            self._clone_source = None
+            imgui.close_current_popup()
+        imgui.same_line()
+        if imgui.button("Cancel", imgui.ImVec2(90, 0)) or imgui.is_key_pressed(imgui.Key.escape):
+            self._clone_source = None
+            imgui.close_current_popup()
+        imgui.end_popup()
+
+    def _clone_model_file(self, source: str, path: str) -> None:
+        try:
+            shutil.copy2(source, path)
+        except OSError as exc:
+            self.status = f"Not cloned: {exc.strerror or exc}"
+            return
+        self._explorer_dirty = True
+        self._explorer_reveal = explorer.norm(path)
+        self.status = f"Cloned {Path(source).name} to {Path(path).name}"
 
     def _delete_model_file(self, path: str) -> None:
         problem = trash.move_to_trash(path)
@@ -3730,8 +3919,17 @@ class Viewer:
                 to_open = to_open or result[0]
                 gone = gone or result[1]
             imgui.pop_style_var()
+            blank = imgui.PopupFlags_.mouse_button_right | imgui.PopupFlags_.no_open_over_items
+            if imgui.begin_popup_context_window("##explorer_blank_menu", blank):      # right click on empty space
+                if imgui.menu_item("Add folder...", "", False)[0]:
+                    self.add_explorer_root()
+                if imgui.menu_item("Refresh", "", False)[0]:
+                    self._explorer_dirty = True
+                imgui.end_popup()
         imgui.end_child()
         if to_open:
+            self._explorer_seen = explorer.norm(to_open)     # opened from here: it is in view already, so no scrolling
+            self._explorer_reveal = None
             self.open_file(to_open)
         if gone:
             self.explorer_roots = [r for r in self.explorer_roots if explorer.norm(r) != explorer.norm(gone)]
@@ -3803,6 +4001,9 @@ class Viewer:
                 imgui.set_clipboard_text(node.path)
             if not node.is_dir:
                 imgui.separator()
+                if imgui.menu_item("Clone...", "", False)[0]:
+                    self._clone_source = node.path
+                    self._clone_name = explorer.default_clone_name(node.path)
                 if imgui.menu_item("Delete...", "", False)[0]:
                     self._delete_candidate = node.path
             if is_root:
@@ -4129,6 +4330,8 @@ class Viewer:
         if self.hover is None or item is None:
             return
         self._draw_lines(view_proj, item.transform * glm.translate(glm.vec3(*self.hover)), TOOL_COLORS[self.tool])
+        for cell in symmetric_cells(self.hover, item.matrix.size, tuple(self.mirror), self.radial)[1:]:
+            self._draw_lines(view_proj, item.transform * glm.translate(glm.vec3(*cell)), TOOL_COLORS[self.tool], 0.5)
         if self.hover_face is not None and self.tool is Tool.PLACE:
             self._draw_face(view_proj, self.hover, *self.hover_face, HOVER_FACE_COLOR)
 

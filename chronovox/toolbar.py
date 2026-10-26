@@ -22,6 +22,41 @@ GRASS, BRICK, SKY, SPARK = (0.35, 0.85, 0.45), (0.95, 0.35, 0.30), (0.40, 0.65, 
 STEEL = (0.78, 0.81, 0.86)
 
 
+IMAGES = None        # the picture icons (see icons.py); set by the viewer. Without one, icons are drawn in code.
+
+
+def set_images(images) -> None:
+    global IMAGES
+    IMAGES = images
+
+
+def _picture(name: str):
+    return IMAGES.get(name) if IMAGES is not None else None
+
+
+def icon_button(label: str, icon: str, height: float | None = None, width: float | None = None) -> bool:
+    """A button with a picture icon before its text (just the text if there is no such icon)."""
+    picture = _picture(icon)
+    if picture is None:
+        return imgui.button(label, imgui.ImVec2(width or 0.0, height or 0.0))
+    texture, pic_w, pic_h = picture
+    shown = label.split("##")[0]
+    padding = imgui.get_style().frame_padding
+    text_w = imgui.calc_text_size(shown).x
+    full_w = width or (padding.x * 2 + pic_w + (6 + text_w if shown else 0))
+    full_h = height or max(imgui.get_frame_height(), pic_h + 4)
+    clicked = imgui.button(label if "##" in label else f"##{label}", imgui.ImVec2(full_w, full_h))
+    low, high = imgui.get_item_rect_min(), imgui.get_item_rect_max()
+    draw = imgui.get_window_draw_list()
+    x = round(low.x + padding.x + 1)
+    y = round((low.y + high.y) / 2 - pic_h / 2)
+    draw.add_image(imgui.ImTextureRef(texture.glo), _pt(x, y), _pt(x + pic_w, y + pic_h))
+    if shown:
+        draw.add_text(_pt(x + pic_w + 6, (low.y + high.y) / 2 - imgui.get_text_line_height() / 2),
+                      imgui.get_color_u32(imgui.Col_.text), shown)
+    return clicked
+
+
 @dataclass(frozen=True)
 class ToolButton:
     key: object          # what is returned when the button is clicked
@@ -68,7 +103,16 @@ def _arrow_head(draw, tip, direction, size, color) -> None:
 
 
 def draw_icon(draw, kind: str, cx: float, cy: float, r: float, brush=(0.35, 0.60, 0.95)) -> None:
-    """Draw an icon of half-size ``r`` around (cx, cy). ``brush`` is the current brush color, shown on color tools."""
+    """Draw an icon of half-size ``r`` around (cx, cy). ``brush`` is the current brush color, shown on color tools.
+
+    A picture from assets/icons is used when there is one for this name, at its own size so the pixels stay sharp.
+    """
+    picture = _picture(kind)
+    if picture is not None:
+        texture, width, height = picture
+        x, y = round(cx - width / 2), round(cy - height / 2)
+        draw.add_image(imgui.ImTextureRef(texture.glo), _pt(x, y), _pt(x + width, y + height))
+        return
     thick = max(r * 0.22, 1.5)
     if kind in ("place", "erase"):
         _cube(draw, cx - r * .15, cy + r * .2, r * .78, ((.62, .66, .74), (.45, .48, .56), (.34, .36, .43)))
@@ -107,6 +151,12 @@ def draw_icon(draw, kind: str, cx: float, cy: float, r: float, brush=(0.35, 0.60
             draw.add_line(_pt(cx - dx * r, cy - dy * r), _pt(cx + dx * r, cy + dy * r), _col(STEEL), thick * .8)
         for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             _arrow_head(draw, (cx + dx * r, cy + dy * r), (dx, dy), r * .45, _col(STEEL))
+    elif kind == "pivot":
+        draw.add_circle(_pt(cx, cy), r * .55, _col(SPARK), 0, thick * .8)
+        draw.add_circle_filled(_pt(cx, cy), r * .16, _col(SPARK))
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            draw.add_line(_pt(cx + dx * r * .55, cy + dy * r * .55), _pt(cx + dx * r * .95, cy + dy * r * .95),
+                          _col(SPARK), thick * .8)
     elif kind == "resize":
         draw.add_rect(_pt(cx - r * .55, cy - r * .55), _pt(cx + r * .55, cy + r * .55), _col(STEEL), thickness=thick * .8)
         for sx, sy in ((1, 1), (-1, -1)):

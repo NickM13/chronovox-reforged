@@ -2,7 +2,7 @@ from chronovox.editing import (ACTIONS, BRUSHES, FILL_FOR_ACTION, FILL_TOOLS, Br
 
 
 def test_the_actions_and_brushes_are_the_ones_on_the_keys():
-    assert [a.value for a in ACTIONS] == ["Place", "Erase", "Paint", "Pick color", "Select"]
+    assert [a.value for a in ACTIONS] == ["Place", "Erase", "Replace", "Pick color", "Select"]
     assert [b.value for b in BRUSHES] == ["Voxel", "Box", "Fill"]
 
 

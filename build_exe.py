@@ -26,6 +26,7 @@ def main() -> None:
         "--icon", str(ico),
         "--collect-all", "glfw",                     # the GLFW library file that glfw loads at start-up
         "--add-data", f"{ROOT / 'assets' / 'icon_256.png'};assets",     # the picture for the window itself
+        "--add-data", f"{ROOT / 'assets' / 'icons'};assets/icons",      # the picture icons of the tools and buttons
         "--distpath", str(ROOT / "dist"), "--workpath", str(BUILD / "work"), "--specpath", str(BUILD),
         str(ROOT / "run_chronovox.py"),
     ]

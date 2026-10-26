@@ -366,3 +366,42 @@ def test_the_fill_tools_are_the_three_modes_and_other_tools_are_unaffected():
     assert [t.value for t in FILL_TOOLS] == ["Fill: append", "Fill: erase", "Fill: replace"]
     v = np.zeros((2, 2, 2), np.uint16)
     assert find_target(v, Tool.PLACE, (0.5, 9, 0.5), (0, -1, 0)) == (0, 0, 0)
+
+
+def _two_blocks():
+    """A 5x1x1 row: red, red, empty, red, near-red; palette 1 = red, 2 = near red, 3 = blue."""
+    import numpy as np
+    from chronovox.model import Matrix, Model
+    palette = np.array([[200, 0, 0, 255], [210, 10, 10, 255], [0, 0, 200, 255]], np.uint8)
+    matrix = Matrix("m", np.array([[[1, 1, 0, 1, 2]]], np.uint16), (0, 0, 0))
+    return Model(palette, [matrix]), matrix
+
+
+def test_similar_mask_matches_close_colors_only_within_the_tolerance():
+    import numpy as np
+    from chronovox.editing import similar_mask
+    model, matrix = _two_blocks()
+    assert similar_mask(matrix.voxels, model.palette, 1, 0).tolist() == [[[True, True, False, True, False]]]
+    assert similar_mask(matrix.voxels, model.palette, 1, 5).tolist() == [[[True, True, False, True, True]]]
+    assert similar_mask(matrix.voxels, model.palette, 3, 5).sum() == 0
+
+
+def test_replace_fill_can_leave_the_gap_or_ignore_it_and_widen_with_tolerance():
+    from chronovox.editing import FillTarget, Tool, apply_fill
+    green = (0, 200, 0, 255)
+    model, matrix = _two_blocks()
+    assert apply_fill(model, matrix, Tool.FILL_REPLACE, FillTarget((0, 0, 0), 0, 1), green) == 2     # as before
+    model, matrix = _two_blocks()
+    assert apply_fill(model, matrix, Tool.FILL_REPLACE, FillTarget((0, 0, 0), 0, 1), green, contiguous=False) == 3
+    model, matrix = _two_blocks()
+    assert apply_fill(model, matrix, Tool.FILL_REPLACE, FillTarget((0, 0, 0), 0, 1), green, True, 5) == 2
+    model, matrix = _two_blocks()
+    assert apply_fill(model, matrix, Tool.FILL_REPLACE, FillTarget((0, 0, 0), 0, 1), green, False, 5) == 4
+
+
+def test_the_wand_follows_contiguous_and_tolerance():
+    from chronovox import selection
+    model, matrix = _two_blocks()
+    assert selection.wand_mask(matrix.voxels, (0, 0, 0)).sum() == 2
+    assert selection.wand_mask(matrix.voxels, (0, 0, 0), model.palette, False, 0).sum() == 3
+    assert selection.wand_mask(matrix.voxels, (0, 0, 0), model.palette, False, 5).sum() == 4

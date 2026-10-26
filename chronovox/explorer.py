@@ -101,3 +101,36 @@ def folders(node: Node) -> list[str]:
     if not node.is_dir:
         return []
     return [node.path] + [path for child in node.children for path in folders(child)]
+
+
+_BAD_NAME_CHARACTERS = '<>:"/\|?*'
+
+
+def clone_target(source: str, name: str) -> tuple[str | None, str | None]:
+    """Where a clone of a model goes: next to it, under ``name`` (its extension is added if missing).
+
+    Returns (path, None), or (None, why not): the name is empty or unusable, or a file with it exists already.
+    """
+    name = name.strip()
+    extension = os.path.splitext(source)[1]
+    if name.lower().endswith(extension.lower()):
+        name = name[:-len(extension)] if extension else name
+    name = name.strip().rstrip(".")
+    if not name:
+        return None, "Type a name for the copy."
+    if any(c in name for c in _BAD_NAME_CHARACTERS) or any(ord(c) < 32 for c in name):
+        return None, "A name cannot contain any of  < > : \" / \ | ? *"
+    path = os.path.join(os.path.dirname(source), name + extension)
+    if os.path.exists(path):
+        return None, f"{name + extension} already exists there."
+    return path, None
+
+
+def default_clone_name(source: str) -> str:
+    """A free name for a copy of a model, without its extension: ``Tree`` -> ``Tree2``, then ``Tree3``..."""
+    stem, extension = os.path.splitext(os.path.basename(source))
+    stem = stem.rstrip("0123456789") or stem
+    number = 2
+    while os.path.exists(os.path.join(os.path.dirname(source), f"{stem}{number}{extension}")):
+        number += 1
+    return f"{stem}{number}"

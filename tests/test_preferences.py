@@ -99,3 +99,10 @@ def test_the_set_all_resolution_is_remembered_and_checked():
     assert Preferences.from_dict({"bulk_resolution": 5}).bulk_resolution == 5
     for bad in (0, 9, "five", None, True, 2.5e9):
         assert Preferences.from_dict({"bulk_resolution": bad}).bulk_resolution == 1
+
+
+def test_the_explorer_sidebar_is_wider_by_default_and_an_unchanged_old_width_follows():
+    from chronovox.preferences import DEFAULT_EXPLORER_WIDTH, Preferences
+    assert DEFAULT_EXPLORER_WIDTH == 390.0 and Preferences().explorer_width == 390.0
+    assert Preferences.from_dict({"explorer_width": 260}).explorer_width == 390.0      # the old default: never resized
+    assert Preferences.from_dict({"explorer_width": 300}).explorer_width == 300.0      # a width someone chose is kept

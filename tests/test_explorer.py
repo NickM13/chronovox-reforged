@@ -1,6 +1,7 @@
 import os
 
 from chronovox.explorer import filtered, folders, norm, route_to, scan
+from chronovox import explorer
 from chronovox.preferences import Preferences
 
 
@@ -75,3 +76,29 @@ def test_folders_lists_every_folder_in_the_tree(tmp_path):
     touch(tmp_path / "c" / "y.cvox")
     tree = scan(str(tmp_path))
     assert sorted(folders(tree)) == sorted(str(tmp_path / n) for n in ("", "a", "a/b", "c")) or len(folders(tree)) == 4
+
+
+def test_clone_target_goes_next_to_the_model_and_keeps_its_extension(tmp_path):
+    source = tmp_path / "Tree.cvox"
+    source.write_bytes(b"x")
+    path, problem = explorer.clone_target(str(source), "Oak")
+    assert problem is None and path == str(tmp_path / "Oak.cvox")
+    assert explorer.clone_target(str(source), "Oak.cvox")[0] == str(tmp_path / "Oak.cvox")
+
+
+def test_clone_target_refuses_empty_taken_and_unusable_names(tmp_path):
+    source = tmp_path / "Tree.cvox"
+    source.write_bytes(b"x")
+    (tmp_path / "Oak.cvox").write_bytes(b"y")
+    for name in ("", "  ", "Oak", "a/b", "what?"):
+        path, problem = explorer.clone_target(str(source), name)
+        assert path is None and problem
+    assert explorer.clone_target(str(source), "Tree")[0] is None          # not over itself
+
+
+def test_default_clone_name_is_the_next_free_number(tmp_path):
+    source = tmp_path / "Tree.cvox"
+    source.write_bytes(b"x")
+    assert explorer.default_clone_name(str(source)) == "Tree2"
+    (tmp_path / "Tree2.cvox").write_bytes(b"x")
+    assert explorer.default_clone_name(str(source)) == "Tree3"

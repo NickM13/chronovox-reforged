@@ -93,6 +93,28 @@ class SelectionEdit:
 
 
 @dataclass
+class PaletteEdit:
+    """One palette color changed to another: every voxel that uses it changes color with it."""
+    model: Model
+    index: int            # 0-based row of the palette
+    old: tuple            # RGBA before
+    new: tuple
+
+    @property
+    def nbytes(self) -> int:
+        return 64
+
+    def undo(self) -> None:
+        self.model.palette[self.index] = self.old
+
+    def redo(self) -> None:
+        self.model.palette[self.index] = self.new
+
+    def describe(self) -> str:
+        return f"recolor of palette color {self.index + 1}"
+
+
+@dataclass
 class TransformEdit:
     """A change of a matrix's position, pivot or rotation."""
     matrix: Matrix

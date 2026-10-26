@@ -24,6 +24,7 @@ class MatrixTool(Enum):
     MOVE = "Move"
     ROTATE = "Rotate"
     RESIZE = "Resize"
+    PIVOT = "Origin"          # moves the pivot while the matrix stays where it is
 
 
 def closest_param_on_line(ray_origin, ray_direction, line_point, line_direction) -> float | None:
